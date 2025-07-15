@@ -541,14 +541,34 @@ def build_dashboard():
                 st.write("Detalle de errores de login (implementa aquí si es necesario).")
     else:
         st.subheader("Navegación – métricas")
-        nav_df = navigation_stats(df, user_col=user_col)
-        if nav_df.empty:
-            st.info("No se encontraron eventos de navegación (contengan 'nav').")
+        # Filtrar eventos de navegación af_navigation
+        nav_events = df[df["Event Name"].eq("af_navigation")].copy()
+        if nav_events.empty:
+            st.info("No se encontraron eventos 'af_navigation'.")
         else:
-            st.metric("Usuarios únicos", int(nav_df["usuarios"].sum()))
-            st.metric("Eventos totales", int(nav_df["eventos"].sum()))
-            st.bar_chart(nav_df.set_index("category")["eventos"])
-            st.dataframe(nav_df)
+            # Extraer 'group' y 'option' del JSON en Event Value
+            nav_events[["group", "option"]] = nav_events["Event Value"].apply(
+                lambda v: pd.Series(json.loads(v))
+            )
+            # Agrupar y contar
+            nav_grouped = (
+                nav_events
+                .groupby(["group", "option"])
+                .size()
+                .reset_index(name="Count")
+            )
+            # Gráfico de barras por opción coloreado por grupo
+            fig = px.bar(
+                nav_grouped,
+                x="option",
+                y="Count",
+                color="group",
+                title="Navegación – uso por categoría y opción",
+                labels={"option": "Opción", "Count": "Cantidad", "group": "Grupo"},
+                barmode="group",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+            st.dataframe(nav_grouped)
 
 if __name__ == "__main__":
     import argparse, textwrap, sys
