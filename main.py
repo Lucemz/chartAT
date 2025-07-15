@@ -14,6 +14,8 @@ import json
 from pathlib import Path
 import pandas as pd
 import logging
+import plotly.graph_objects as go
+import plotly.express as px
 import sys
 # Modo dashboard: activamos si hay Streamlit disponible
 try:
@@ -377,6 +379,7 @@ def _plot_pie(
                     labels=labels,
                     values=values,
                     hoverinfo="label+percent",
+                    marker=dict(colors=px.colors.qualitative.Plotly),
                 )
             ]
         )
