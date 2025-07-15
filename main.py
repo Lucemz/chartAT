@@ -20,8 +20,31 @@ try:
     import streamlit as st
     import matplotlib.pyplot as plt
     IS_STREAMLIT = True
+    from contextlib import contextmanager
 except ModuleNotFoundError:
     IS_STREAMLIT = False
+# ──────────────────────────────────────────────────────────────────────────
+# Soporte de pie interactivas con Plotly + streamlit‑plotly‑events
+try:
+    from streamlit_plotly_events import plotly_events
+    import plotly.graph_objects as go
+    HAS_PLOTLY_EVENTS = True
+except ModuleNotFoundError:
+    HAS_PLOTLY_EVENTS = False
+# ------------------------------------------------------------------
+# Modal seguro: usa st.modal si la versión lo soporta, si no muestra
+# un sub‑encabezado como fallback.
+# ------------------------------------------------------------------
+@contextmanager
+def _safe_modal(title: str):
+    if hasattr(st, "modal"):
+        with st.modal(title):
+            yield
+    else:
+        st.subheader(title)
+        yield
+        st.info("Desplázate para cerrar el detalle.")
+# ──────────────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -184,6 +207,9 @@ def _categorize_flow(df: pd.DataFrame,
         "both"        : len(both_users),      # tuvo éxito y error (cualquier orden)
         "only_error"  : len(only_error_users),
         "only_success": len(only_success_users),
+        "only_error_ids": only_error_users,
+        "only_success_ids": only_success_users,
+        "both_ids": both_users,
         # claves legacy (compatibilidad)
         "error_then_ok": len(both_users),
         "error_only"   : len(only_error_users),
@@ -316,11 +342,106 @@ def user_history(df: pd.DataFrame,
 # ──────────────────────────────────────────────────────────────────────────────
 # 1.c Dashboard Streamlit
 # ──────────────────────────────────────────────────────────────────────────────
-def _plot_pie(values, labels, title: str):
-    fig, ax = plt.subplots()
-    ax.pie(values, labels=labels, autopct="%1.1f%%")
-    ax.set_title(title)
-    st.pyplot(fig)
+def _plot_pie(
+    values,
+    labels,
+    title: str,
+    *,
+    masks: dict[str, pd.Series] | None = None,
+    df: pd.DataFrame | None = None,
+    user_col: str,
+):
+    """
+    Dibuja un gráfico de pie.  Si está disponible la librería
+    `streamlit_plotly_events`, el gráfico es interactivo: al hacer clic sobre
+    un sector se abre un modal con la tabla `Event Value` y su contador.
+
+    Parámetros
+    ----------
+    values : list‑like
+        Valores numéricos para cada sector.
+    labels : list‑like
+        Etiquetas de los sectores (deben coincidir con las claves de `masks`).
+    title : str
+        Título del gráfico.
+    masks : dict[label, boolean‑mask], opcional
+        Máscaras booleanas (mismo tamaño que `df`) que definen qué filas
+        pertenecen a cada etiqueta/sector.
+    df : DataFrame, opcional
+        DataFrame original para crear el detalle en la modal.
+    """
+    if HAS_PLOTLY_EVENTS:
+        fig = go.Figure(
+            data=[
+                go.Pie(
+                    labels=labels,
+                    values=values,
+                    hoverinfo="label+percent",
+                )
+            ]
+        )
+        fig.update_layout(title_text=title)
+        selected = plotly_events(
+            fig,
+            click_event=True,
+            select_event=False,
+            hover_event=False,
+            key=f"pie_{title}",
+        )
+        if selected and masks and df is not None:
+            idx = selected[0].get("pointIndex", selected[0].get("pointNumber"))
+            sel_label = labels[idx]
+            sel_mask = masks.get(sel_label)
+            if sel_mask is not None:
+                subset = df.loc[sel_mask].copy()
+                # Keep only the last event per user for this category
+                last_per_user = (
+                    subset.sort_values("Event Time")
+                          .drop_duplicates(subset=[user_col], keep="last")
+                )
+                counts = (
+                    last_per_user["Event Value"]
+                    .value_counts(dropna=False)
+                    .rename("Count")
+                    .reset_index()
+                    .rename(columns={"index": "Event Value"})
+                )
+                with _safe_modal(f"{title} – {sel_label}"):
+                    st.dataframe(counts)
+    else:
+        fig, ax = plt.subplots()
+        ax.pie(values, labels=labels, autopct="%1.1f%%")
+        ax.set_title(title)
+        st.pyplot(fig)
+        st.warning(
+            "Interactividad deshabilitada: instala 'streamlit-plotly-events' para activarla."
+        )
+
+# ──────────────────────────────────────────────────────────────────────────
+# Útil para generar máscaras de error/éxito según flujo
+# ──────────────────────────────────────────────────────────────────────────
+def _get_flow_masks(
+    df: pd.DataFrame, flow: str, user_col: str = "Customer User ID"
+) -> tuple[pd.Series, pd.Series]:
+    """
+    Devuelve (err_mask, ok_mask) para el flujo indicado ('registro' o 'login').
+    """
+    flow = flow.lower()
+    if flow == "registro":
+        err_mask = (
+            df["Event Name"].str.lower().eq("ud_error")
+            & df["Event Value"].str.contains('"ud_flow":"registro"', case=False, na=False)
+        )
+        ok_mask = df["Event Name"].str.lower().eq("af_complete_registration")
+    elif flow == "login":
+        err_mask = (
+            df["Event Name"].str.lower().eq("ud_error")
+            & df["Event Value"].str.contains('"ud_flow":"login"', case=False, na=False)
+        )
+        ok_mask = df["Event Name"].str.lower().eq("af_login")
+    else:
+        raise ValueError("flow debe ser 'registro' o 'login'")
+    return err_mask, ok_mask
 
 def build_dashboard():
     st.title("Dashboard de eventos AppsFlyer")
@@ -344,10 +465,20 @@ def build_dashboard():
     section = st.sidebar.radio("Análisis", ("Registro", "Login", "Navegación"))
     if section == "Registro":
         stats = registration_stats(df, user_col=user_col)
+        err_mask, ok_mask = _get_flow_masks(df, "registro", user_col=user_col)
+        # Definimos máscaras para drill-down correcto
+        masks = {
+            "Solo éxito": ok_mask & df[user_col].isin(stats["only_success_ids"]),
+            "Solo error": err_mask & df[user_col].isin(stats["only_error_ids"]),
+            "Éxito+Error": err_mask & df[user_col].isin(stats["both_ids"]),
+        }
         _plot_pie(
             [stats["only_success"], stats["only_error"], stats["both"]],
             ["Solo éxito", "Solo error", "Éxito+Error"],
-            "Registro – usuarios"
+            "Registro – usuarios",
+            masks=masks,
+            df=df,
+            user_col=user_col,
         )
 
         st.subheader("Eventos")
@@ -364,13 +495,27 @@ def build_dashboard():
         col4.metric("Éxito+Error",  stats["both"])
         # st.caption(f"{stats['only_error']/stats['total_users']:.1%} de los usuarios tuvo al menos un error; "
         #            f"{stats['only_success']/stats['total_users']:.1%} nunca presentó errores.")
+        # Modal de errores de registro
+        if "error" in stats and stats["only_error"] > 0:
+            with _safe_modal("Errores de registro"):
+                st.write("Detalle de errores de registro (implementa aquí si es necesario).")
 
     elif section == "Login":
         stats = login_stats(df, user_col=user_col)
+        err_mask, ok_mask = _get_flow_masks(df, "login", user_col=user_col)
+        # Definimos máscaras para drill-down correcto
+        masks = {
+            "Solo éxito": ok_mask & df[user_col].isin(stats["only_success_ids"]),
+            "Solo error": err_mask & df[user_col].isin(stats["only_error_ids"]),
+            "Éxito+Error": err_mask & df[user_col].isin(stats["both_ids"]),
+        }
         _plot_pie(
             [stats["only_success"], stats["only_error"], stats["both"]],
             ["Solo éxito", "Solo error", "Éxito+Error"],
-            "Login – usuarios"
+            "Login – usuarios",
+            masks=masks,
+            df=df,
+            user_col=user_col,
         )
 
         st.subheader("Eventos")
@@ -387,6 +532,10 @@ def build_dashboard():
         col4.metric("Éxito+Error",  stats["both"])
         # st.caption(f"{stats['only_error']/stats['total_users']:.1%} de los usuarios tuvo al menos un error; "
         #            f"{stats['only_success']/stats['total_users']:.1%} nunca presentó errores.")
+        # Modal de errores de login
+        if "error" in stats and stats["only_error"] > 0:
+            with _safe_modal("Errores de login"):
+                st.write("Detalle de errores de login (implementa aquí si es necesario).")
     else:
         st.subheader("Navegación – métricas")
         nav_df = navigation_stats(df, user_col=user_col)
@@ -452,3 +601,4 @@ if __name__ == "__main__":
         logging.info("Sin flags: entrando al menú interactivo.")
         interactive_menu(data)
     logging.info("Proceso finalizado.")
+
